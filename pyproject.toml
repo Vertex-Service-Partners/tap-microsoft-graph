@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "tap-microsoft-graph"
+version = "0.0.1"
+description = "Singer tap for Microsoft Graph — pulls mail messages and attachment metadata from a shared Outlook mailbox into a Singer-compatible target. Built for the Vertex Service Partners Marketing Spend Agent."
+authors = ["Vertex Service Partners"]
+readme = "README.md"
+keywords = [
+    "ELT",
+    "Microsoft Graph",
+    "Outlook",
+    "Singer",
+    "Meltano",
+]
+license = "Apache 2.0"
+packages = [{ include = "tap_microsoft_graph" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+singer-sdk = "~=0.54.2"
+requests = "~=2.32.3"
+beautifulsoup4 = "~=4.12.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "~=8.3"
+ruff = "~=0.7"
+
+[tool.ruff]
+src = ["tap_microsoft_graph"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[build-system]
+requires = ["poetry-core>=1.0.8"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+"tap-microsoft-graph" = "tap_microsoft_graph.tap:TapMicrosoftGraph.cli"

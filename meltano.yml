@@ -1,0 +1,38 @@
+version: 1
+default_environment: dev
+project_id: tap-microsoft-graph
+send_anonymous_usage_stats: false
+environments:
+  - name: dev
+plugins:
+  extractors:
+    - name: tap-microsoft-graph
+      namespace: tap_microsoft_graph
+      pip_url: -e .
+      capabilities:
+        - state
+        - catalog
+        - discover
+        - about
+      config:
+        api_url: https://graph.microsoft.com/v1.0
+        start_date: '2024-01-01T00:00:00Z'
+        stage_upload_enabled: false
+      settings:
+        - name: client_id
+          kind: password
+        - name: client_secret
+          kind: password
+        - name: tenant_id
+        - name: shared_mailbox_id
+        - name: api_url
+          value: https://graph.microsoft.com/v1.0
+        - name: start_date
+          value: '2024-01-01T00:00:00Z'
+        - name: stage_upload_enabled
+          kind: boolean
+          value: false
+  loaders:
+    - name: target-jsonl
+      variant: andyh1203
+      pip_url: target-jsonl
