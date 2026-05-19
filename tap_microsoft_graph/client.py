@@ -63,23 +63,13 @@ class MicrosoftGraphStream(RESTStream):
         body = response.json()
         return body.get("@odata.nextLink")
 
-    def get_url(self, context: dict | None) -> str:
-        """Return the request URL.
-
-        On the first page this is ``url_base + path``. On follow-up pages
-        the next-page token is itself a fully-qualified URL, so it
-        supersedes the computed path. We use the stream-level
-        ``next_page_token`` plumbed through by ``RESTStream`` via
-        ``prepare_request``.
-        """
-        # ``RESTStream.prepare_request`` already substitutes the next-page
-        # token if it's a full URL — but only when path is empty. The
-        # cleanest way to support both first-page and follow-up pages
-        # uniformly is to inspect the most recent token via the
-        # `request_decorator` hook. In practice, returning the default URL
-        # works because singer-sdk's RESTStream.prepare_request will swap
-        # the URL when next_page_token is a string URL.
-        return f"{self.url_base}{self.path}"
+    # NOTE: we don't override get_url — the default RESTStream.get_url
+    # substitutes context keys like {message_id} into the path template.
+    # Overriding it (and skipping that substitution) was the cause of an
+    # early bug where child-stream URLs came out as
+    # /messages/%7Bmessage_id%7D/attachments. Follow-up pages (Graph's
+    # @odata.nextLink) are handled in prepare_request below by using the
+    # full next-page URL verbatim, which bypasses get_url entirely.
 
     def get_url_params(
         self,
