@@ -74,10 +74,24 @@ class AttachmentsStream(MicrosoftGraphStream):
     ) -> dict[str, Any]:
         if next_page_token:
             return {}
+        # NOTE: @odata.type can NOT be in $select (Graph 400s on it), but it
+        # IS returned automatically on polymorphic types like attachments
+        # (fileAttachment vs itemAttachment vs referenceAttachment), so we
+        # still get it in the response body for post_process to read.
         return {
-            "$select": "id,name,contentType,size,isInline,@odata.type",
+            "$select": "id,name,contentType,size,isInline",
             "$top": 50,
         }
+
+    def get_records(self, context: dict | None = None):
+        """Skip cleanly when no parent context — singer-sdk sometimes invokes
+        a child stream's sync with no context (e.g. when no parent record had
+        has_attachments=True). Without this, the {message_id} placeholder
+        stays unresolved in the URL and Graph 400s.
+        """
+        if not context or not context.get("message_id"):
+            return
+        yield from super().get_records(context)
 
     def post_process(self, row: dict, context: dict | None = None) -> dict:
         message_id = (context or {}).get("message_id")
