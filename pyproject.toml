@@ -19,6 +19,9 @@ python = ">=3.10,<4"
 singer-sdk = "~=0.54.2"
 requests = "~=2.32.3"
 beautifulsoup4 = "~=4.12.3"
+# Used only when stage_upload_enabled=true to PUT attachment bytes into a
+# Snowflake internal stage via a side-channel (bypassing Singer record bloat).
+snowflake-connector-python = "~=3.12"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "~=8.3"

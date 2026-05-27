@@ -21,7 +21,11 @@ exist, and the ``stage_upload_enabled`` config flag to be true.
 from __future__ import annotations
 
 import base64
+import contextlib
+import datetime as dt
 import logging
+import os
+import tempfile
 from typing import Any, ClassVar
 
 from singer_sdk import typing as th
@@ -30,6 +34,11 @@ from tap_microsoft_graph.client import MicrosoftGraphStream
 from tap_microsoft_graph.streams.messages import MessagesStream
 
 LOGGER = logging.getLogger(__name__)
+
+# Target Snowflake stage that receives attachment bytes. Pinned here (rather
+# than configurable) because PARSE_DOCUMENT in the dbt arch_prep layer also
+# hardcodes the same path — keep them in sync.
+STAGE_FQN = "ARCH_RAW.OUTLOOK_MARKETING_INBOX.MARKETING_EMAIL_ATTACHMENTS"
 
 
 class AttachmentsStream(MicrosoftGraphStream):
@@ -128,28 +137,6 @@ class AttachmentsStream(MicrosoftGraphStream):
 
         return record
 
-    def _upload_to_snowflake_stage(
-        self,
-        *,
-        message_id: str | None,
-        attachment_id: str | None,
-        filename: str,
-    ) -> str:
-        """Stream attachment bytes from Graph into a Snowflake internal stage.
-
-        This is the place the side-channel will hook in. Disabled until
-        the stage exists and ``stage_upload_enabled`` is set.
-        """
-        # 1. Fetch the raw bytes from Graph (this hits a separate endpoint:
-        #    GET /users/{mailbox}/messages/{message_id}/attachments/{attachment_id}/$value)
-        # 2. PUT to @ARCH_RAW.OUTLOOK_MARKETING_INBOX.MARKETING_EMAIL_ATTACHMENTS/<yyyy>/<mm>/<dd>/<message_id>/<attachment_id>__<safe_name>
-        # 3. Return the relative stage_path.
-        raise NotImplementedError(
-            "Snowflake stage upload not yet wired; see follow-up PR. "
-            "The MARKETING_EMAIL_ATTACHMENTS stage must exist first."
-        )
-
-    # Reserved for the side-channel implementation, kept here for traceability.
     _SAFE_FILENAME_ALLOWED = frozenset(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
     )
@@ -158,15 +145,18 @@ class AttachmentsStream(MicrosoftGraphStream):
     def _safe_filename(cls, name: str) -> str:
         return "".join(c if c in cls._SAFE_FILENAME_ALLOWED else "_" for c in name)
 
-    # Helper retained for the side-channel: download bytes via Graph.
     def _fetch_attachment_bytes(self, message_id: str, attachment_id: str) -> bytes:
+        """Download attachment bytes via Graph and base64-decode.
+
+        For fileAttachments, Graph returns the bytes in the response body's
+        ``contentBytes`` field as base64. Item/referenceAttachments don't
+        have ``contentBytes`` and raise.
+        """
         mailbox = self.config["shared_mailbox_id"]
         url = (
             f"{self.url_base}/users/{mailbox}/messages/"
             f"{message_id}/attachments/{attachment_id}"
         )
-        # Graph returns the attachment object — for fileAttachment, the
-        # bytes live in ``contentBytes`` as base64.
         auth_headers = (self.authenticator.auth_headers or {}) if self.authenticator else {}
         resp = self.requests_session.get(url, headers=auth_headers, timeout=120)
         resp.raise_for_status()
@@ -178,3 +168,87 @@ class AttachmentsStream(MicrosoftGraphStream):
                 "(likely an itemAttachment or referenceAttachment, not fileAttachment)."
             )
         return base64.b64decode(b64)
+
+    def _snowflake_conn(self):
+        """Lazy-init shared Snowflake connection for stage PUTs.
+
+        Reuses the same env vars that target-snowflake reads
+        (``TARGET_SNOWFLAKE_{ACCOUNT,USER,PASSWORD,ROLE,WAREHOUSE,DATABASE}``)
+        so config in Dagster+ stays a single source of truth.
+        """
+        cached = getattr(self, "_sf_conn_cache", None)
+        if cached is not None:
+            return cached
+        # Import lazily — snowflake-connector-python is heavy and only needed
+        # when stage_upload_enabled=true.
+        import snowflake.connector
+        cached = snowflake.connector.connect(
+            account=os.environ["TARGET_SNOWFLAKE_ACCOUNT"],
+            user=os.environ["TARGET_SNOWFLAKE_USER"],
+            password=os.environ["TARGET_SNOWFLAKE_PASSWORD"],
+            role=os.environ["TARGET_SNOWFLAKE_ROLE"],
+            warehouse=os.environ["TARGET_SNOWFLAKE_WAREHOUSE"],
+        )
+        self._sf_conn_cache = cached
+        return cached
+
+    def _upload_to_snowflake_stage(
+        self,
+        *,
+        message_id: str | None,
+        attachment_id: str | None,
+        filename: str,
+    ) -> str:
+        """Stream attachment bytes from Graph into the Snowflake internal stage.
+
+        Returns the relative ``stage_path`` (without the leading ``@stage``)
+        where the file landed, e.g. ``2026/05/27/<msg>/<att>__invoice.pdf``.
+        Downstream ``PARSE_DOCUMENT`` references this path.
+
+        Snowflake's PUT command needs a local file path — write to a
+        per-call tempfile, PUT it, then delete.
+        """
+        # Date-partition by today's UTC date (close enough to received_at
+        # for our hourly tap; avoids needing to plumb received_at through
+        # the child context).
+        today = dt.datetime.now(dt.UTC)
+        date_prefix = f"{today.year:04d}/{today.month:02d}/{today.day:02d}"
+        safe_msg = self._safe_filename(message_id or "unknown_msg")
+        safe_att = self._safe_filename(attachment_id or "unknown_att")
+        safe_name = self._safe_filename(filename)
+        stage_path = f"{date_prefix}/{safe_msg}/{safe_att}__{safe_name}"
+
+        # 1. Fetch bytes from Graph.
+        contents = self._fetch_attachment_bytes(message_id, attachment_id)
+
+        # 2. Write to a temp DIR (not tempfile) so we control the basename.
+        #    Snowflake's PUT preserves the local file's basename in the
+        #    stage, so the local filename IS the final stage filename.
+        final_basename = f"{safe_att}__{safe_name}"
+        tmpdir = tempfile.mkdtemp()
+        local_path = os.path.join(tmpdir, final_basename)
+        try:
+            with open(local_path, "wb") as f:
+                f.write(contents)
+            # PUT — file:// URL on the LOCAL side, @stage path on the
+            # remote side. AUTO_COMPRESS=FALSE so PARSE_DOCUMENT can read
+            # the original (PDF/XLSX are already compressed; doubling
+            # adds nothing and breaks PARSE_DOCUMENT's content-type sniff).
+            # OVERWRITE=TRUE in case of re-sync.
+            stage_dir = f"@{STAGE_FQN}/{date_prefix}/{safe_msg}"
+            sql = (
+                f"PUT 'file://{local_path}' {stage_dir} "
+                "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            )
+            cur = self._snowflake_conn().cursor()
+            try:
+                cur.execute(sql)
+            finally:
+                cur.close()
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(local_path)
+            with contextlib.suppress(OSError):
+                os.rmdir(tmpdir)
+
+        return stage_path
