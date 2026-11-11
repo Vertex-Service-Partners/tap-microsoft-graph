@@ -26,6 +26,7 @@ import datetime as dt
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from singer_sdk import typing as th
@@ -39,6 +40,82 @@ LOGGER = logging.getLogger(__name__)
 # than configurable) because PARSE_DOCUMENT in the dbt arch_prep layer also
 # hardcodes the same path — keep them in sync.
 STAGE_FQN = "ARCH_RAW.OUTLOOK_MARKETING_INBOX.MARKETING_EMAIL_ATTACHMENTS"
+
+
+class StageUploadConfigError(RuntimeError):
+    """The stage side-channel cannot connect to Snowflake at all.
+
+    Raised *through* the sync instead of being swallowed by the per-file
+    fail-open handler: when credentials are missing or rejected no attachment
+    can land, and a green run that quietly emits metadata rows with no bytes
+    behind them is worse than a red one (TD-2295 — this went unnoticed for
+    two months after the MELTANO user moved to key-pair auth).
+    """
+
+
+def snowflake_private_key_der(value: str) -> bytes:
+    """Normalize ``TARGET_SNOWFLAKE_PRIVATE_KEY`` to unencrypted PKCS#8 DER.
+
+    Accepts the three encodings seen across the Vertex stack: raw PEM,
+    base64-encoded PEM (target-snowflake's historical format) and
+    base64-encoded DER (what Matatika carries since dagster-vertex #47).
+    ``snowflake.connector.connect(private_key=...)`` wants DER bytes.
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    text = value.strip()
+    if "-----BEGIN" in text:
+        key = serialization.load_pem_private_key(text.encode(), password=None)
+    else:
+        raw = base64.b64decode(text)
+        if b"-----BEGIN" in raw:
+            key = serialization.load_pem_private_key(raw, password=None)
+        else:
+            key = serialization.load_der_private_key(raw, password=None)
+    return key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def snowflake_connect_kwargs(env: Mapping[str, str]) -> dict[str, Any]:
+    """Build ``snowflake.connector.connect`` kwargs from the loader's env.
+
+    Reuses the ``TARGET_SNOWFLAKE_*`` variables that target-snowflake reads so
+    the loader's config stays the single source of truth. Key-pair auth
+    (``TARGET_SNOWFLAKE_PRIVATE_KEY``) wins when present; ``TARGET_SNOWFLAKE_PASSWORD``
+    is the fallback. Neither → :class:`StageUploadConfigError`.
+    """
+    try:
+        kwargs: dict[str, Any] = {
+            "account": env["TARGET_SNOWFLAKE_ACCOUNT"],
+            "user": env["TARGET_SNOWFLAKE_USER"],
+            "role": env["TARGET_SNOWFLAKE_ROLE"],
+            "warehouse": env["TARGET_SNOWFLAKE_WAREHOUSE"],
+        }
+    except KeyError as exc:
+        raise StageUploadConfigError(
+            f"stage_upload_enabled=true but {exc} is not set in the environment"
+        ) from exc
+
+    private_key = env.get("TARGET_SNOWFLAKE_PRIVATE_KEY")
+    password = env.get("TARGET_SNOWFLAKE_PASSWORD")
+    if private_key:
+        try:
+            kwargs["private_key"] = snowflake_private_key_der(private_key)
+        except Exception as exc:
+            raise StageUploadConfigError(
+                "TARGET_SNOWFLAKE_PRIVATE_KEY is not a PEM, base64-PEM or base64-DER private key"
+            ) from exc
+    elif password:
+        kwargs["password"] = password
+    else:
+        raise StageUploadConfigError(
+            "stage_upload_enabled=true but neither TARGET_SNOWFLAKE_PRIVATE_KEY "
+            "nor TARGET_SNOWFLAKE_PASSWORD is set in the environment"
+        )
+    return kwargs
 
 
 class AttachmentsStream(MicrosoftGraphStream):
@@ -63,7 +140,11 @@ class AttachmentsStream(MicrosoftGraphStream):
         th.Property("name", th.StringType, description="Attachment filename."),
         th.Property("content_type", th.StringType, description="MIME type."),
         th.Property("size_bytes", th.IntegerType),
-        th.Property("is_inline", th.BooleanType, description="True for inline images (signatures, embedded media)."),
+        th.Property(
+            "is_inline",
+            th.BooleanType,
+            description="True for inline images (signatures, embedded media).",
+        ),
         th.Property(
             "stage_path",
             th.StringType,
@@ -73,7 +154,11 @@ class AttachmentsStream(MicrosoftGraphStream):
                 "Null when stage_upload_enabled=false."
             ),
         ),
-        th.Property("odata_type", th.StringType, description="Graph attachment subtype: fileAttachment | itemAttachment | referenceAttachment."),
+        th.Property(
+            "odata_type",
+            th.StringType,
+            description="Graph attachment subtype: fileAttachment | itemAttachment | referenceAttachment.",
+        ),
     ).to_dict()
 
     def get_url_params(
@@ -116,9 +201,8 @@ class AttachmentsStream(MicrosoftGraphStream):
             "stage_path": None,
         }
 
-        if (
-            self.config.get("stage_upload_enabled")
-            and row.get("@odata.type", "").endswith("fileAttachment")
+        if self.config.get("stage_upload_enabled") and row.get("@odata.type", "").endswith(
+            "fileAttachment"
         ):
             try:
                 record["stage_path"] = self._upload_to_snowflake_stage(
@@ -126,9 +210,15 @@ class AttachmentsStream(MicrosoftGraphStream):
                     attachment_id=attachment_id,
                     filename=row.get("name") or attachment_id,
                 )
+            except StageUploadConfigError:
+                # Nothing can upload until a human fixes the env: fail the
+                # sync so the pipeline goes red (state is not advanced, the
+                # next run retries) instead of emitting metadata rows that
+                # point at bytes which never landed.
+                raise
             except Exception:
-                # Fail open — log and emit metadata row with stage_path=None
-                # so downstream knows the upload didn't happen.
+                # Per-file fail open — log and emit the metadata row with
+                # stage_path=None so downstream knows this upload didn't happen.
                 LOGGER.exception(
                     "Snowflake stage upload failed for message_id=%s attachment_id=%s",
                     message_id,
@@ -153,10 +243,7 @@ class AttachmentsStream(MicrosoftGraphStream):
         have ``contentBytes`` and raise.
         """
         mailbox = self.config["shared_mailbox_id"]
-        url = (
-            f"{self.url_base}/users/{mailbox}/messages/"
-            f"{message_id}/attachments/{attachment_id}"
-        )
+        url = f"{self.url_base}/users/{mailbox}/messages/{message_id}/attachments/{attachment_id}"
         auth_headers = (self.authenticator.auth_headers or {}) if self.authenticator else {}
         resp = self.requests_session.get(url, headers=auth_headers, timeout=120)
         resp.raise_for_status()
@@ -173,8 +260,9 @@ class AttachmentsStream(MicrosoftGraphStream):
         """Lazy-init shared Snowflake connection for stage PUTs.
 
         Reuses the same env vars that target-snowflake reads
-        (``TARGET_SNOWFLAKE_{ACCOUNT,USER,PASSWORD,ROLE,WAREHOUSE,DATABASE}``)
-        so config in Dagster+ stays a single source of truth.
+        (``TARGET_SNOWFLAKE_{ACCOUNT,USER,ROLE,WAREHOUSE}`` plus either
+        ``TARGET_SNOWFLAKE_PRIVATE_KEY`` or ``TARGET_SNOWFLAKE_PASSWORD``) so
+        the loader's config stays a single source of truth.
         """
         cached = getattr(self, "_sf_conn_cache", None)
         if cached is not None:
@@ -182,13 +270,14 @@ class AttachmentsStream(MicrosoftGraphStream):
         # Import lazily — snowflake-connector-python is heavy and only needed
         # when stage_upload_enabled=true.
         import snowflake.connector
-        cached = snowflake.connector.connect(
-            account=os.environ["TARGET_SNOWFLAKE_ACCOUNT"],
-            user=os.environ["TARGET_SNOWFLAKE_USER"],
-            password=os.environ["TARGET_SNOWFLAKE_PASSWORD"],
-            role=os.environ["TARGET_SNOWFLAKE_ROLE"],
-            warehouse=os.environ["TARGET_SNOWFLAKE_WAREHOUSE"],
-        )
+
+        kwargs = snowflake_connect_kwargs(os.environ)
+        try:
+            cached = snowflake.connector.connect(**kwargs)
+        except snowflake.connector.errors.Error as exc:
+            raise StageUploadConfigError(
+                f"Snowflake login for stage uploads failed as user {kwargs['user']!r}: {exc}"
+            ) from exc
         self._sf_conn_cache = cached
         return cached
 
@@ -236,10 +325,7 @@ class AttachmentsStream(MicrosoftGraphStream):
             # adds nothing and breaks PARSE_DOCUMENT's content-type sniff).
             # OVERWRITE=TRUE in case of re-sync.
             stage_dir = f"@{STAGE_FQN}/{date_prefix}/{safe_msg}"
-            sql = (
-                f"PUT 'file://{local_path}' {stage_dir} "
-                "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-            )
+            sql = f"PUT 'file://{local_path}' {stage_dir} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
             cur = self._snowflake_conn().cursor()
             try:
                 cur.execute(sql)
